@@ -10,7 +10,7 @@ RUN mkdir -p nanobot bridge && touch nanobot/__init__.py && \
 
 # Copy the full source and install
 COPY nanobot/ nanobot/
-RUN uv pip install --system --no-cache .
+RUN mkdir -p bridge && uv pip install --system --no-cache .
 
 # Create config directory
 RUN mkdir -p /root/.nanobot
