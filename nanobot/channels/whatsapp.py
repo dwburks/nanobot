@@ -2,14 +2,27 @@
 
 import asyncio
 import json
+import mimetypes
 from collections import OrderedDict
+from typing import Any
 
 from loguru import logger
+
+from pydantic import Field
 
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
-from nanobot.config.schema import WhatsAppConfig
+from nanobot.config.schema import Base
+
+
+class WhatsAppConfig(Base):
+    """WhatsApp channel configuration."""
+
+    enabled: bool = False
+    bridge_url: str = "ws://localhost:3001"
+    bridge_token: str = ""
+    allow_from: list[str] = Field(default_factory=list)
 
 
 class WhatsAppChannel(BaseChannel):
@@ -21,10 +34,16 @@ class WhatsAppChannel(BaseChannel):
     """
 
     name = "whatsapp"
+    display_name = "WhatsApp"
 
-    def __init__(self, config: WhatsAppConfig, bus: MessageBus):
+    @classmethod
+    def default_config(cls) -> dict[str, Any]:
+        return WhatsAppConfig().model_dump(by_alias=True)
+
+    def __init__(self, config: Any, bus: MessageBus):
+        if isinstance(config, dict):
+            config = WhatsAppConfig.model_validate(config)
         super().__init__(config, bus)
-        self.config: WhatsAppConfig = config
         self._ws = None
         self._connected = False
         self._processed_message_ids: OrderedDict[str, None] = OrderedDict()
@@ -128,10 +147,22 @@ class WhatsAppChannel(BaseChannel):
                 logger.info("Voice message received from {}, but direct download from bridge is not yet supported.", sender_id)
                 content = "[Voice Message: Transcription not available for WhatsApp yet]"
 
+            # Extract media paths (images/documents/videos downloaded by the bridge)
+            media_paths = data.get("media") or []
+
+            # Build content tags matching Telegram's pattern: [image: /path] or [file: /path]
+            if media_paths:
+                for p in media_paths:
+                    mime, _ = mimetypes.guess_type(p)
+                    media_type = "image" if mime and mime.startswith("image/") else "file"
+                    media_tag = f"[{media_type}: {p}]"
+                    content = f"{content}\n{media_tag}" if content else media_tag
+
             await self._handle_message(
                 sender_id=sender_id,
                 chat_id=sender,  # Use full LID for replies
                 content=content,
+                media=media_paths,
                 metadata={
                     "message_id": message_id,
                     "timestamp": data.get("timestamp"),

@@ -7,14 +7,16 @@ import re
 import threading
 from collections import OrderedDict
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from loguru import logger
 
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
-from nanobot.config.schema import FeishuConfig
+from nanobot.config.paths import get_media_dir
+from nanobot.config.schema import Base
+from pydantic import Field
 
 import importlib.util
 
@@ -230,6 +232,20 @@ def _extract_post_text(content_json: dict) -> str:
     return text
 
 
+class FeishuConfig(Base):
+    """Feishu/Lark channel configuration using WebSocket long connection."""
+
+    enabled: bool = False
+    app_id: str = ""
+    app_secret: str = ""
+    encrypt_key: str = ""
+    verification_token: str = ""
+    allow_from: list[str] = Field(default_factory=list)
+    react_emoji: str = "THUMBSUP"
+    group_policy: Literal["open", "mention"] = "mention"
+    reply_to_message: bool = False  # If True, bot replies quote the user's original message
+
+
 class FeishuChannel(BaseChannel):
     """
     Feishu/Lark channel using WebSocket long connection.
@@ -243,8 +259,15 @@ class FeishuChannel(BaseChannel):
     """
 
     name = "feishu"
+    display_name = "Feishu"
 
-    def __init__(self, config: FeishuConfig, bus: MessageBus):
+    @classmethod
+    def default_config(cls) -> dict[str, Any]:
+        return FeishuConfig().model_dump(by_alias=True)
+
+    def __init__(self, config: Any, bus: MessageBus):
+        if isinstance(config, dict):
+            config = FeishuConfig.model_validate(config)
         super().__init__(config, bus)
         self.config: FeishuConfig = config
         self._client: Any = None
@@ -252,6 +275,12 @@ class FeishuChannel(BaseChannel):
         self._ws_thread: threading.Thread | None = None
         self._processed_message_ids: OrderedDict[str, None] = OrderedDict()  # Ordered dedup cache
         self._loop: asyncio.AbstractEventLoop | None = None
+
+    @staticmethod
+    def _register_optional_event(builder: Any, method_name: str, handler: Any) -> Any:
+        """Register an event handler only when the SDK supports it."""
+        method = getattr(builder, method_name, None)
+        return method(handler) if callable(method) else builder
 
     async def start(self) -> None:
         """Start the Feishu bot with WebSocket long connection."""
@@ -273,14 +302,24 @@ class FeishuChannel(BaseChannel):
             .app_secret(self.config.app_secret) \
             .log_level(lark.LogLevel.INFO) \
             .build()
-
-        # Create event handler (only register message receive, ignore other events)
-        event_handler = lark.EventDispatcherHandler.builder(
+        builder = lark.EventDispatcherHandler.builder(
             self.config.encrypt_key or "",
             self.config.verification_token or "",
         ).register_p2_im_message_receive_v1(
             self._on_message_sync
-        ).build()
+        )
+        builder = self._register_optional_event(
+            builder, "register_p2_im_message_reaction_created_v1", self._on_reaction_created
+        )
+        builder = self._register_optional_event(
+            builder, "register_p2_im_message_message_read_v1", self._on_message_read
+        )
+        builder = self._register_optional_event(
+            builder,
+            "register_p2_im_chat_access_event_bot_p2p_chat_entered_v1",
+            self._on_bot_p2p_chat_entered,
+        )
+        event_handler = builder.build()
 
         # Create WebSocket client for long connection
         self._ws_client = lark.ws.Client(
@@ -290,16 +329,28 @@ class FeishuChannel(BaseChannel):
             log_level=lark.LogLevel.INFO
         )
 
-        # Start WebSocket client in a separate thread with reconnect loop
+        # Start WebSocket client in a separate thread with reconnect loop.
+        # A dedicated event loop is created for this thread so that lark_oapi's
+        # module-level `loop = asyncio.get_event_loop()` picks up an idle loop
+        # instead of the already-running main asyncio loop, which would cause
+        # "This event loop is already running" errors.
         def run_ws():
-            while self._running:
-                try:
-                    self._ws_client.start()
-                except Exception as e:
-                    logger.warning("Feishu WebSocket error: {}", e)
-                if self._running:
-                    import time
-                    time.sleep(5)
+            import time
+            import lark_oapi.ws.client as _lark_ws_client
+            ws_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(ws_loop)
+            # Patch the module-level loop used by lark's ws Client.start()
+            _lark_ws_client.loop = ws_loop
+            try:
+                while self._running:
+                    try:
+                        self._ws_client.start()
+                    except Exception as e:
+                        logger.warning("Feishu WebSocket error: {}", e)
+                    if self._running:
+                        time.sleep(5)
+            finally:
+                ws_loop.close()
 
         self._ws_thread = threading.Thread(target=run_ws, daemon=True)
         self._ws_thread.start()
@@ -321,6 +372,27 @@ class FeishuChannel(BaseChannel):
         """
         self._running = False
         logger.info("Feishu bot stopped")
+
+    def _is_bot_mentioned(self, message: Any) -> bool:
+        """Check if the bot is @mentioned in the message."""
+        raw_content = message.content or ""
+        if "@_all" in raw_content:
+            return True
+
+        for mention in getattr(message, "mentions", None) or []:
+            mid = getattr(mention, "id", None)
+            if not mid:
+                continue
+            # Bot mentions have no user_id (None or "") but a valid open_id
+            if not getattr(mid, "user_id", None) and (getattr(mid, "open_id", None) or "").startswith("ou_"):
+                return True
+        return False
+
+    def _is_group_message_for_bot(self, message: Any) -> bool:
+        """Allow group messages when policy is open or bot is @mentioned."""
+        if self.config.group_policy == "open":
+            return True
+        return self._is_bot_mentioned(message)
 
     def _add_reaction_sync(self, message_id: str, emoji_type: str) -> None:
         """Sync helper for adding reaction (runs in thread pool)."""
@@ -398,6 +470,34 @@ class FeishuChannel(BaseChannel):
             elements.extend(self._split_headings(remaining))
         return elements or [{"tag": "markdown", "content": content}]
 
+    @staticmethod
+    def _split_elements_by_table_limit(elements: list[dict], max_tables: int = 1) -> list[list[dict]]:
+        """Split card elements into groups with at most *max_tables* table elements each.
+
+        Feishu cards have a hard limit of one table per card (API error 11310).
+        When the rendered content contains multiple markdown tables each table is
+        placed in a separate card message so every table reaches the user.
+        """
+        if not elements:
+            return [[]]
+        groups: list[list[dict]] = []
+        current: list[dict] = []
+        table_count = 0
+        for el in elements:
+            if el.get("tag") == "table":
+                if table_count >= max_tables:
+                    if current:
+                        groups.append(current)
+                    current = []
+                    table_count = 0
+                current.append(el)
+                table_count += 1
+            else:
+                current.append(el)
+        if current:
+            groups.append(current)
+        return groups or [[]]
+
     def _split_headings(self, content: str) -> list[dict]:
         """Split content by headings, converting headings to div elements."""
         protected = content
@@ -432,8 +532,124 @@ class FeishuChannel(BaseChannel):
 
         return elements or [{"tag": "markdown", "content": content}]
 
+    # ── Smart format detection ──────────────────────────────────────────
+    # Patterns that indicate "complex" markdown needing card rendering
+    _COMPLEX_MD_RE = re.compile(
+        r"```"                        # fenced code block
+        r"|^\|.+\|.*\n\s*\|[-:\s|]+\|"  # markdown table (header + separator)
+        r"|^#{1,6}\s+"                # headings
+        , re.MULTILINE,
+    )
+
+    # Simple markdown patterns (bold, italic, strikethrough)
+    _SIMPLE_MD_RE = re.compile(
+        r"\*\*.+?\*\*"               # **bold**
+        r"|__.+?__"                   # __bold__
+        r"|(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)"  # *italic* (single *)
+        r"|~~.+?~~"                   # ~~strikethrough~~
+        , re.DOTALL,
+    )
+
+    # Markdown link: [text](url)
+    _MD_LINK_RE = re.compile(r"\[([^\]]+)\]\((https?://[^\)]+)\)")
+
+    # Unordered list items
+    _LIST_RE = re.compile(r"^[\s]*[-*+]\s+", re.MULTILINE)
+
+    # Ordered list items
+    _OLIST_RE = re.compile(r"^[\s]*\d+\.\s+", re.MULTILINE)
+
+    # Max length for plain text format
+    _TEXT_MAX_LEN = 200
+
+    # Max length for post (rich text) format; beyond this, use card
+    _POST_MAX_LEN = 2000
+
+    @classmethod
+    def _detect_msg_format(cls, content: str) -> str:
+        """Determine the optimal Feishu message format for *content*.
+
+        Returns one of:
+        - ``"text"``        – plain text, short and no markdown
+        - ``"post"``        – rich text (links only, moderate length)
+        - ``"interactive"`` – card with full markdown rendering
+        """
+        stripped = content.strip()
+
+        # Complex markdown (code blocks, tables, headings) → always card
+        if cls._COMPLEX_MD_RE.search(stripped):
+            return "interactive"
+
+        # Long content → card (better readability with card layout)
+        if len(stripped) > cls._POST_MAX_LEN:
+            return "interactive"
+
+        # Has bold/italic/strikethrough → card (post format can't render these)
+        if cls._SIMPLE_MD_RE.search(stripped):
+            return "interactive"
+
+        # Has list items → card (post format can't render list bullets well)
+        if cls._LIST_RE.search(stripped) or cls._OLIST_RE.search(stripped):
+            return "interactive"
+
+        # Has links → post format (supports <a> tags)
+        if cls._MD_LINK_RE.search(stripped):
+            return "post"
+
+        # Short plain text → text format
+        if len(stripped) <= cls._TEXT_MAX_LEN:
+            return "text"
+
+        # Medium plain text without any formatting → post format
+        return "post"
+
+    @classmethod
+    def _markdown_to_post(cls, content: str) -> str:
+        """Convert markdown content to Feishu post message JSON.
+
+        Handles links ``[text](url)`` as ``a`` tags; everything else as ``text`` tags.
+        Each line becomes a paragraph (row) in the post body.
+        """
+        lines = content.strip().split("\n")
+        paragraphs: list[list[dict]] = []
+
+        for line in lines:
+            elements: list[dict] = []
+            last_end = 0
+
+            for m in cls._MD_LINK_RE.finditer(line):
+                # Text before this link
+                before = line[last_end:m.start()]
+                if before:
+                    elements.append({"tag": "text", "text": before})
+                elements.append({
+                    "tag": "a",
+                    "text": m.group(1),
+                    "href": m.group(2),
+                })
+                last_end = m.end()
+
+            # Remaining text after last link
+            remaining = line[last_end:]
+            if remaining:
+                elements.append({"tag": "text", "text": remaining})
+
+            # Empty line → empty paragraph for spacing
+            if not elements:
+                elements.append({"tag": "text", "text": ""})
+
+            paragraphs.append(elements)
+
+        post_body = {
+            "zh_cn": {
+                "content": paragraphs,
+            }
+        }
+        return json.dumps(post_body, ensure_ascii=False)
+
     _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".ico", ".tiff", ".tif"}
     _AUDIO_EXTS = {".opus"}
+    _VIDEO_EXTS = {".mp4", ".mov", ".avi"}
     _FILE_TYPE_MAP = {
         ".opus": "opus", ".mp4": "mp4", ".pdf": "pdf", ".doc": "doc", ".docx": "doc",
         ".xls": "xls", ".xlsx": "xls", ".ppt": "ppt", ".pptx": "ppt",
@@ -559,8 +775,7 @@ class FeishuChannel(BaseChannel):
             (file_path, content_text) - file_path is None if download failed
         """
         loop = asyncio.get_running_loop()
-        media_dir = Path.home() / ".nanobot" / "media"
-        media_dir.mkdir(parents=True, exist_ok=True)
+        media_dir = get_media_dir("feishu")
 
         data, filename = None, None
 
@@ -580,8 +795,9 @@ class FeishuChannel(BaseChannel):
                     None, self._download_file_sync, message_id, file_key, msg_type
                 )
                 if not filename:
-                    ext = {"audio": ".opus", "media": ".mp4"}.get(msg_type, "")
-                    filename = f"{file_key[:16]}{ext}"
+                    filename = file_key[:16]
+                if msg_type == "audio" and not filename.endswith(".opus"):
+                    filename = f"{filename}.opus"
 
         if data and filename:
             file_path = media_dir / filename
@@ -590,6 +806,77 @@ class FeishuChannel(BaseChannel):
             return str(file_path), f"[{msg_type}: {filename}]"
 
         return None, f"[{msg_type}: download failed]"
+
+    _REPLY_CONTEXT_MAX_LEN = 200
+
+    def _get_message_content_sync(self, message_id: str) -> str | None:
+        """Fetch the text content of a Feishu message by ID (synchronous).
+
+        Returns a "[Reply to: ...]" context string, or None on failure.
+        """
+        from lark_oapi.api.im.v1 import GetMessageRequest
+        try:
+            request = GetMessageRequest.builder().message_id(message_id).build()
+            response = self._client.im.v1.message.get(request)
+            if not response.success():
+                logger.debug(
+                    "Feishu: could not fetch parent message {}: code={}, msg={}",
+                    message_id, response.code, response.msg,
+                )
+                return None
+            items = getattr(response.data, "items", None)
+            if not items:
+                return None
+            msg_obj = items[0]
+            raw_content = getattr(msg_obj, "body", None)
+            raw_content = getattr(raw_content, "content", None) if raw_content else None
+            if not raw_content:
+                return None
+            try:
+                content_json = json.loads(raw_content)
+            except (json.JSONDecodeError, TypeError):
+                return None
+            msg_type = getattr(msg_obj, "msg_type", "")
+            if msg_type == "text":
+                text = content_json.get("text", "").strip()
+            elif msg_type == "post":
+                text, _ = _extract_post_content(content_json)
+                text = text.strip()
+            else:
+                text = ""
+            if not text:
+                return None
+            if len(text) > self._REPLY_CONTEXT_MAX_LEN:
+                text = text[: self._REPLY_CONTEXT_MAX_LEN] + "..."
+            return f"[Reply to: {text}]"
+        except Exception as e:
+            logger.debug("Feishu: error fetching parent message {}: {}", message_id, e)
+            return None
+
+    def _reply_message_sync(self, parent_message_id: str, msg_type: str, content: str) -> bool:
+        """Reply to an existing Feishu message using the Reply API (synchronous)."""
+        from lark_oapi.api.im.v1 import ReplyMessageRequest, ReplyMessageRequestBody
+        try:
+            request = ReplyMessageRequest.builder() \
+                .message_id(parent_message_id) \
+                .request_body(
+                    ReplyMessageRequestBody.builder()
+                    .msg_type(msg_type)
+                    .content(content)
+                    .build()
+                ).build()
+            response = self._client.im.v1.message.reply(request)
+            if not response.success():
+                logger.error(
+                    "Failed to reply to Feishu message {}: code={}, msg={}, log_id={}",
+                    parent_message_id, response.code, response.msg, response.get_log_id()
+                )
+                return False
+            logger.debug("Feishu reply sent to message {}", parent_message_id)
+            return True
+        except Exception as e:
+            logger.error("Error replying to Feishu message {}: {}", parent_message_id, e)
+            return False
 
     def _send_message_sync(self, receive_id_type: str, receive_id: str, msg_type: str, content: str) -> bool:
         """Send a single message (text/image/file/interactive) synchronously."""
@@ -627,6 +914,38 @@ class FeishuChannel(BaseChannel):
             receive_id_type = "chat_id" if msg.chat_id.startswith("oc_") else "open_id"
             loop = asyncio.get_running_loop()
 
+            # Handle tool hint messages as code blocks in interactive cards.
+            # These are progress-only messages and should bypass normal reply routing.
+            if msg.metadata.get("_tool_hint"):
+                if msg.content and msg.content.strip():
+                    await self._send_tool_hint_card(
+                        receive_id_type, msg.chat_id, msg.content.strip()
+                    )
+                return
+
+            # Determine whether the first message should quote the user's message.
+            # Only the very first send (media or text) in this call uses reply; subsequent
+            # chunks/media fall back to plain create to avoid redundant quote bubbles.
+            reply_message_id: str | None = None
+            if (
+                self.config.reply_to_message
+                and not msg.metadata.get("_progress", False)
+            ):
+                reply_message_id = msg.metadata.get("message_id") or None
+
+            first_send = True  # tracks whether the reply has already been used
+
+            def _do_send(m_type: str, content: str) -> None:
+                """Send via reply (first message) or create (subsequent)."""
+                nonlocal first_send
+                if reply_message_id and first_send:
+                    first_send = False
+                    ok = self._reply_message_sync(reply_message_id, m_type, content)
+                    if ok:
+                        return
+                    # Fall back to regular send if reply fails
+                self._send_message_sync(receive_id_type, msg.chat_id, m_type, content)
+
             for file_path in msg.media:
                 if not os.path.isfile(file_path):
                     logger.warning("Media file not found: {}", file_path)
@@ -636,29 +955,50 @@ class FeishuChannel(BaseChannel):
                     key = await loop.run_in_executor(None, self._upload_image_sync, file_path)
                     if key:
                         await loop.run_in_executor(
-                            None, self._send_message_sync,
-                            receive_id_type, msg.chat_id, "image", json.dumps({"image_key": key}, ensure_ascii=False),
+                            None, _do_send,
+                            "image", json.dumps({"image_key": key}, ensure_ascii=False),
                         )
                 else:
                     key = await loop.run_in_executor(None, self._upload_file_sync, file_path)
                     if key:
-                        media_type = "audio" if ext in self._AUDIO_EXTS else "file"
+                        # Use msg_type "media" for audio/video so users can play inline;
+                        # "file" for everything else (documents, archives, etc.)
+                        if ext in self._AUDIO_EXTS or ext in self._VIDEO_EXTS:
+                            media_type = "media"
+                        else:
+                            media_type = "file"
                         await loop.run_in_executor(
-                            None, self._send_message_sync,
-                            receive_id_type, msg.chat_id, media_type, json.dumps({"file_key": key}, ensure_ascii=False),
+                            None, _do_send,
+                            media_type, json.dumps({"file_key": key}, ensure_ascii=False),
                         )
 
             if msg.content and msg.content.strip():
-                card = {"config": {"wide_screen_mode": True}, "elements": self._build_card_elements(msg.content)}
-                await loop.run_in_executor(
-                    None, self._send_message_sync,
-                    receive_id_type, msg.chat_id, "interactive", json.dumps(card, ensure_ascii=False),
-                )
+                fmt = self._detect_msg_format(msg.content)
+
+                if fmt == "text":
+                    # Short plain text – send as simple text message
+                    text_body = json.dumps({"text": msg.content.strip()}, ensure_ascii=False)
+                    await loop.run_in_executor(None, _do_send, "text", text_body)
+
+                elif fmt == "post":
+                    # Medium content with links – send as rich-text post
+                    post_body = self._markdown_to_post(msg.content)
+                    await loop.run_in_executor(None, _do_send, "post", post_body)
+
+                else:
+                    # Complex / long content – send as interactive card
+                    elements = self._build_card_elements(msg.content)
+                    for chunk in self._split_elements_by_table_limit(elements):
+                        card = {"config": {"wide_screen_mode": True}, "elements": chunk}
+                        await loop.run_in_executor(
+                            None, _do_send,
+                            "interactive", json.dumps(card, ensure_ascii=False),
+                        )
 
         except Exception as e:
             logger.error("Error sending Feishu message: {}", e)
 
-    def _on_message_sync(self, data: "P2ImMessageReceiveV1") -> None:
+    def _on_message_sync(self, data: Any) -> None:
         """
         Sync handler for incoming messages (called from WebSocket thread).
         Schedules async handling in the main event loop.
@@ -666,7 +1006,7 @@ class FeishuChannel(BaseChannel):
         if self._loop and self._loop.is_running():
             asyncio.run_coroutine_threadsafe(self._on_message(data), self._loop)
 
-    async def _on_message(self, data: "P2ImMessageReceiveV1") -> None:
+    async def _on_message(self, data: Any) -> None:
         """Handle incoming message from Feishu."""
         try:
             event = data.event
@@ -691,6 +1031,10 @@ class FeishuChannel(BaseChannel):
             chat_id = message.chat_id
             chat_type = message.chat_type
             msg_type = message.message_type
+
+            if chat_type == "group" and not self._is_group_message_for_bot(message):
+                logger.debug("Feishu: skipping group message (not mentioned)")
+                return
 
             # Add reaction
             await self._add_reaction(message_id, self.config.react_emoji)
@@ -726,6 +1070,12 @@ class FeishuChannel(BaseChannel):
                 file_path, content_text = await self._download_and_save_media(msg_type, content_json, message_id)
                 if file_path:
                     media_paths.append(file_path)
+
+                if msg_type == "audio" and file_path:
+                    transcription = await self.transcribe_audio(file_path)
+                    if transcription:
+                        content_text = f"[transcription: {transcription}]"
+
                 content_parts.append(content_text)
 
             elif msg_type in ("share_chat", "share_user", "interactive", "share_calendar_event", "system", "merge_forward"):
@@ -736,6 +1086,19 @@ class FeishuChannel(BaseChannel):
 
             else:
                 content_parts.append(MSG_TYPE_MAP.get(msg_type, f"[{msg_type}]"))
+
+            # Extract reply context (parent/root message IDs)
+            parent_id = getattr(message, "parent_id", None) or None
+            root_id = getattr(message, "root_id", None) or None
+
+            # Prepend quoted message text when the user replied to another message
+            if parent_id and self._client:
+                loop = asyncio.get_running_loop()
+                reply_ctx = await loop.run_in_executor(
+                    None, self._get_message_content_sync, parent_id
+                )
+                if reply_ctx:
+                    content_parts.insert(0, reply_ctx)
 
             content = "\n".join(content_parts) if content_parts else ""
 
@@ -753,8 +1116,98 @@ class FeishuChannel(BaseChannel):
                     "message_id": message_id,
                     "chat_type": chat_type,
                     "msg_type": msg_type,
+                    "parent_id": parent_id,
+                    "root_id": root_id,
                 }
             )
 
         except Exception as e:
             logger.error("Error processing Feishu message: {}", e)
+
+    def _on_reaction_created(self, data: Any) -> None:
+        """Ignore reaction events so they do not generate SDK noise."""
+        pass
+
+    def _on_message_read(self, data: Any) -> None:
+        """Ignore read events so they do not generate SDK noise."""
+        pass
+
+    def _on_bot_p2p_chat_entered(self, data: Any) -> None:
+        """Ignore p2p-enter events when a user opens a bot chat."""
+        logger.debug("Bot entered p2p chat (user opened chat window)")
+        pass
+
+    @staticmethod
+    def _format_tool_hint_lines(tool_hint: str) -> str:
+        """Split tool hints across lines on top-level call separators only."""
+        parts: list[str] = []
+        buf: list[str] = []
+        depth = 0
+        in_string = False
+        quote_char = ""
+        escaped = False
+
+        for i, ch in enumerate(tool_hint):
+            buf.append(ch)
+
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == quote_char:
+                    in_string = False
+                continue
+
+            if ch in {'"', "'"}:
+                in_string = True
+                quote_char = ch
+                continue
+
+            if ch == "(":
+                depth += 1
+                continue
+
+            if ch == ")" and depth > 0:
+                depth -= 1
+                continue
+
+            if ch == "," and depth == 0:
+                next_char = tool_hint[i + 1] if i + 1 < len(tool_hint) else ""
+                if next_char == " ":
+                    parts.append("".join(buf).rstrip())
+                    buf = []
+
+        if buf:
+            parts.append("".join(buf).strip())
+
+        return "\n".join(part for part in parts if part)
+
+    async def _send_tool_hint_card(self, receive_id_type: str, receive_id: str, tool_hint: str) -> None:
+        """Send tool hint as an interactive card with formatted code block.
+
+        Args:
+            receive_id_type: "chat_id" or "open_id"
+            receive_id: The target chat or user ID
+            tool_hint: Formatted tool hint string (e.g., 'web_search("q"), read_file("path")')
+        """
+        loop = asyncio.get_running_loop()
+
+        # Put each top-level tool call on its own line without altering commas inside arguments.
+        formatted_code = self._format_tool_hint_lines(tool_hint)
+
+        card = {
+            "config": {"wide_screen_mode": True},
+            "elements": [
+                {
+                    "tag": "markdown",
+                    "content": f"**Tool Calls**\n\n```text\n{formatted_code}\n```"
+                }
+            ]
+        }
+
+        await loop.run_in_executor(
+            None, self._send_message_sync,
+            receive_id_type, receive_id, "interactive",
+            json.dumps(card, ensure_ascii=False),
+        )
